@@ -835,6 +835,7 @@ engine_repository(
     patches = [
         "//patches:v8_source_portability.patch",
         "//patches:v8_array_sort_elements_kind.patch",
+        "//patches:v8_la57.patch",
         "//third_party/v8:v8_defs.patch",
     ],
     strip_prefix = "v8-15.2.124.1",

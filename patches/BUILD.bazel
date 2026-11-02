@@ -27,6 +27,7 @@ exports_files([
     "tikv-jemalloc-sys_dependency_flags.patch",
     "tonic-zstd-level1.patch",
     "v8_array_sort_elements_kind.patch",
+    "v8_la57.patch",
     "v8_source_portability.patch",
     "webrtc-sys_hermetic_darwin_sysroot.patch",
     "windows-link.patch",

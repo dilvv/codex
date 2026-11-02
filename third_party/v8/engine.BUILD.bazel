@@ -119,6 +119,8 @@ v8_config(
         "V8_ENABLE_WEBASSEMBLY",
         "V8_ENABLE_UNDEFINED_DOUBLE",
         "V8_USE_HOST_CPU_ARM_FEATURES",
+        # Match the LA57 backport, including generators and Rust bindings.
+        "V8_SUPPORT_LA57",
     ] + [
         "GOOGLE3",
         "V8_ADVANCED_BIGINT_ALGORITHMS",

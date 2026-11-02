@@ -1,0 +1,636 @@
+# Backport LA57 support to V8 15.2.124.1.
+# Upstream:
+# https://github.com/v8/v8/commit/2f22e9ddc83a9e50f4514a2e613b4f905bb1624f
+# https://github.com/v8/v8/commit/25852dbecbcbfe149f0e188577401a0b7927aa39
+# Adapted only for the older BUILD contexts and iOS reservation guard.
+# Codex owns the engine BUILD and must enable V8_SUPPORT_LA57 separately.
+#
+diff --git a/orig/v8-15.2.124.1/BUILD.bazel b/mod/v8-15.2.124.1/BUILD.bazel
+index 83396f2..1b103b6 100644
+--- a/orig/v8-15.2.124.1/BUILD.bazel
++++ b/mod/v8-15.2.124.1/BUILD.bazel
+@@ -256,6 +256,11 @@ v8_flag(
+     default = False,
+ )
+ 
++v8_flag(
++    name = "v8_support_la57",
++    default = True,
++)
++
+ selects.config_setting_group(
+     name = "enable_drumbrake_x64",
+     match_all = [
+@@ -534,6 +539,7 @@ v8_config(
+         "v8_enable_vtunejit": "ENABLE_VTUNE_JIT_INTERFACE",
+         "v8_enable_undefined_double": "V8_ENABLE_UNDEFINED_DOUBLE",
+         "v8_use_host_cpu_arm_features": "V8_USE_HOST_CPU_ARM_FEATURES",
++        "v8_support_la57": "V8_SUPPORT_LA57",
+     },
+     defines = [
+         "GOOGLE3",
+diff --git a/orig/v8-15.2.124.1/BUILD.gn b/mod/v8-15.2.124.1/BUILD.gn
+index 39f578a..893b453 100644
+--- a/orig/v8-15.2.124.1/BUILD.gn
++++ b/mod/v8-15.2.124.1/BUILD.gn
+@@ -49,6 +49,10 @@ declare_args() {
+   # Sets -DV8_ENABLE_FUTURE.
+   v8_enable_future = false
+ 
++  # Support 57-bit virtual addresses (LA57) on x64.
++  # Sets -DV8_SUPPORT_LA57.
++  v8_support_la57 = true
++
+   # Sets -DENABLE_SYSTEM_INSTRUMENTATION. Enables OS-dependent event tracing
+   v8_enable_system_instrumentation = (is_win || is_mac) && !v8_use_perfetto
+ 
+@@ -1068,6 +1072,7 @@ external_v8_defines = [
+   "V8_IS_TSAN",
+   "V8_ENABLE_DIRECT_HANDLE",
+   "V8_MINORMS_STRING_SHORTCUTTING",
++  "V8_SUPPORT_LA57",
+   "V8_HAVE_TARGET_OS",
+   "V8_TARGET_OS_ANDROID",
+   "V8_TARGET_OS_FUCHSIA",
+@@ -1137,6 +1142,9 @@ if (v8_enable_direct_handle) {
+ if (v8_shortcut_strings_in_minor_ms) {
+   enabled_external_v8_defines += [ "V8_MINORMS_STRING_SHORTCUTTING" ]
+ }
++if (v8_support_la57) {
++  enabled_external_v8_defines += [ "V8_SUPPORT_LA57" ]
++}
+ 
+ # V8_TARGET_OS_ defines. The target OS may differ from host OS e.g. in
+ # mksnapshot. We additionally set V8_HAVE_TARGET_OS to determine that a
+@@ -3238,6 +3246,7 @@ generated_file("v8_generate_features_json") {
+     v8_imminent_deprecation_warnings = v8_imminent_deprecation_warnings
+     v8_optimized_debug = v8_optimized_debug
+     v8_random_seed = v8_random_seed
++    v8_support_la57 = v8_support_la57
+     v8_use_perfetto = v8_use_perfetto
+     v8_cppgc_microtask_queue = v8_cppgc_microtask_queue
+     v8_use_siphash = v8_use_siphash
+diff --git a/orig/v8-15.2.124.1/include/v8-internal.h b/mod/v8-15.2.124.1/include/v8-internal.h
+index 22a0ab5..351d75c 100644
+--- a/orig/v8-15.2.124.1/include/v8-internal.h
++++ b/mod/v8-15.2.124.1/include/v8-internal.h
+@@ -366,15 +366,23 @@ constexpr size_t kMaxExternalPointers = 0;
+ 
+ #endif  // V8_COMPRESS_POINTERS
+ 
++#if V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
++constexpr uint64_t kExternalPointerMarkBit = 1ULL << 56;
++constexpr uint64_t kExternalPointerTagShift = 57;
++constexpr uint64_t kExternalPointerTagMask = 0xfe00000000000000ULL;
++constexpr uint64_t kExternalPointerTagAndMarkbitMask = 0xff00000000000000ULL;
++constexpr uint64_t kExternalPointerPayloadMask = 0x00ffffffffffffffULL;
++#else   // !(V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57)
+ constexpr uint64_t kExternalPointerMarkBit = 1ULL << 48;
+ constexpr uint64_t kExternalPointerTagShift = 49;
+ constexpr uint64_t kExternalPointerTagMask = 0x00fe000000000000ULL;
++constexpr uint64_t kExternalPointerTagAndMarkbitMask = 0x00ff000000000000ULL;
++constexpr uint64_t kExternalPointerPayloadMask = 0xff00ffffffffffffULL;
++#endif  // !(V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57)
+ constexpr uint64_t kExternalPointerShiftedTagMask =
+     kExternalPointerTagMask >> kExternalPointerTagShift;
+ static_assert(kExternalPointerShiftedTagMask << kExternalPointerTagShift ==
+               kExternalPointerTagMask);
+-constexpr uint64_t kExternalPointerTagAndMarkbitMask = 0x00ff000000000000ULL;
+-constexpr uint64_t kExternalPointerPayloadMask = 0xff00ffffffffffffULL;
+ 
+ // A ExternalPointerHandle represents a (opaque) reference to an external
+ // pointer that can be stored inside the sandbox. A ExternalPointerHandle has
+@@ -663,8 +671,8 @@ struct TagRange {
+ // use ExternalPointerHandles directly and use them to access the pointers in an
+ // ExternalPointerTable.
+ //
+-// The tag is currently in practice limited to 15 bits since it needs to fit
+-// together with a marking bit into the unused parts of a pointer.
++// The tag is limited to 7 bits since it needs to fit together with a marking
++// bit into the unused parts of a 57-bit pointer to support LA57 on x64.
+ enum ExternalPointerTag : uint16_t {
+   kFirstExternalPointerTag = 0,
+   kExternalPointerNullTag = 0,
+@@ -746,6 +754,9 @@ enum ExternalPointerTag : uint16_t {
+   kLastExternalPointerTag = 0x7f,
+ };
+ 
++// All tags must fit into the 7 tag bits of an external pointer table entry.
++static_assert(kLastExternalPointerTag <= 0x7f);
++
+ constexpr const char* ToString(ExternalPointerTag tag) {
+   switch (tag) {
+ #define ENUM_CASE(name)             \
+diff --git a/orig/v8-15.2.124.1/src/codegen/code-stub-assembler.cc b/mod/v8-15.2.124.1/src/codegen/code-stub-assembler.cc
+index 50551c7..6d5517a 100644
+--- a/orig/v8-15.2.124.1/src/codegen/code-stub-assembler.cc
++++ b/mod/v8-15.2.124.1/src/codegen/code-stub-assembler.cc
+@@ -2049,9 +2049,9 @@ TNode<RawPtrT> CodeStubAssembler::LoadExternalPointerFromObject(
+   if (tag_range.Size() == 1) {
+     // The common and simple case: we expect exactly one tag.
+     TNode<IntPtrT> tag_bits = UncheckedCast<IntPtrT>(
+-        WordAnd(entry, UintPtrConstant(kExternalPointerTagMask)));
++        WordAnd(entry, UniqueUintPtrConstant(kExternalPointerTagMask)));
+     tag_bits = UncheckedCast<IntPtrT>(
+-        WordShr(tag_bits, UintPtrConstant(kExternalPointerTagShift)));
++        WordShr(tag_bits, UniqueUintPtrConstant(kExternalPointerTagShift)));
+     TNode<Uint32T> tag =
+         UncheckedCast<Uint32T>(TruncateIntPtrToInt32(tag_bits));
+     TNode<Uint32T> expected_tag = Uint32Constant(tag_range.first);
+@@ -2062,7 +2062,7 @@ TNode<RawPtrT> CodeStubAssembler::LoadExternalPointerFromObject(
+     UNREACHABLE();
+   }
+   return UncheckedCast<IntPtrT>(
+-      WordAnd(entry, UintPtrConstant(kExternalPointerPayloadMask)));
++      WordAnd(entry, UniqueUintPtrConstant(kExternalPointerPayloadMask)));
+ #else
+   return LoadObjectField<RawPtrT>(object, offset);
+ #endif  // V8_ENABLE_SANDBOX
+@@ -2092,8 +2092,8 @@ void CodeStubAssembler::StoreExternalPointerToObject(TNode<HeapObject> object,
+ 
+   TNode<UintPtrT> value = UncheckedCast<UintPtrT>(pointer);
+   value = UncheckedCast<UintPtrT>(WordOr(
+-      value, UintPtrConstant((uint64_t{tag} << kExternalPointerTagShift) |
+-                             kExternalPointerMarkBit)));
++      value, UniqueUintPtrConstant((uint64_t{tag} << kExternalPointerTagShift) |
++                                   kExternalPointerMarkBit)));
+   StoreNoWriteBarrier(MachineType::PointerRepresentation(), table, table_offset,
+                       value);
+ #else
+@@ -2198,7 +2198,7 @@ TNode<UintPtrT> CodeStubAssembler::ComputeJSDispatchTableEntryOffset(
+   // to be sure that the offset will always fit into a 32-bit integer.
+   static_assert(kJSDispatchTableReservationSize <= 4ULL * GB);
+   TNode<UintPtrT> offset = ChangeUint32ToWord(
+-      Word32Shl(index, Uint32Constant(kJSDispatchTableEntrySizeLog2)));
++      Word32Shl(index, UniqueUint32Constant(kJSDispatchTableEntrySizeLog2)));
+   return offset;
+ }
+ 
+@@ -2215,12 +2215,13 @@ TNode<Code> CodeStubAssembler::LoadCodeObjectFromJSDispatchTable(
+ 
+   TNode<UintPtrT> shifted_value;
+   if (JSDispatchEntry::kObjectPointerOffset == 0) {
+-    shifted_value =
+-        WordShr(value, UintPtrConstant(JSDispatchEntry::kObjectPointerShift));
++    shifted_value = WordShr(
++        value, UniqueUintPtrConstant(JSDispatchEntry::kObjectPointerShift));
+   } else {
+     shifted_value = UintPtrAdd(
+-        WordShr(value, UintPtrConstant(JSDispatchEntry::kObjectPointerShift)),
+-        UintPtrConstant(JSDispatchEntry::kObjectPointerOffset));
++        WordShr(value,
++                UniqueUintPtrConstant(JSDispatchEntry::kObjectPointerShift)),
++        UniqueUintPtrConstant(JSDispatchEntry::kObjectPointerOffset));
+   }
+ 
+   value = UncheckedCast<UintPtrT>(
+@@ -2233,8 +2234,8 @@ TNode<Uint16T> CodeStubAssembler::LoadParameterCountFromJSDispatchTable(
+   TNode<RawPtrT> table =
+       ExternalConstant(ExternalReference::js_dispatch_table_address(isolate()));
+   TNode<UintPtrT> offset = ComputeJSDispatchTableEntryOffset(handle);
+-  offset = UintPtrAdd(offset,
+-                      UintPtrConstant(JSDispatchEntry::kParameterCountOffset));
++  offset = UintPtrAdd(
++      offset, UniqueUintPtrConstant(JSDispatchEntry::kParameterCountOffset));
+   static_assert(JSDispatchEntry::kParameterCountSize == 2);
+   return Load<Uint16T>(table, offset);
+ }
+@@ -2293,10 +2294,10 @@ TNode<TrustedObject> CodeStubAssembler::ResolveIndirectPointerHandle(
+ 
+   if (IsFastIndirectPointerTagRange(tag_range)) {
+     uint64_t mask = ComputeUntaggingMaskForFastIndirectPointerTag(tag_range);
+-    value = WordAnd(value, UintPtrConstant(mask));
++    value = WordAnd(value, UniqueUintPtrConstant(mask));
+   } else {
+     TNode<UintPtrT> tag =
+-        WordShr(value, UintPtrConstant(kTrustedPointerTableTagShift));
++        WordShr(value, UniqueUintPtrConstant(kTrustedPointerTableTagShift));
+ 
+     TNode<BoolT> is_valid;
+     if (tag_range.Size() == 1) {
+@@ -2309,7 +2310,8 @@ TNode<TrustedObject> CodeStubAssembler::ResolveIndirectPointerHandle(
+ 
+     value = SelectConstant<UintPtrT>(is_valid, value, UintPtrConstant(0));
+ 
+-    value = WordAnd(value, UintPtrConstant(kTrustedPointerTablePayloadMask));
++    value =
++        WordAnd(value, UniqueUintPtrConstant(kTrustedPointerTablePayloadMask));
+   }
+   return TrustedCast<TrustedObject>(BitcastWordToTagged(value),
+                                     "from trusted table");
+diff --git a/orig/v8-15.2.124.1/src/codegen/x64/macro-assembler-x64.cc b/mod/v8-15.2.124.1/src/codegen/x64/macro-assembler-x64.cc
+index 0003268..295e875 100644
+--- a/orig/v8-15.2.124.1/src/codegen/x64/macro-assembler-x64.cc
++++ b/mod/v8-15.2.124.1/src/codegen/x64/macro-assembler-x64.cc
+@@ -895,8 +895,10 @@ void MacroAssembler::ResolveIndirectPointerHandle(
+     xorq(destination, destination);
+     bind(&done);
+ 
+-    shlq(destination, Immediate(16));
+-    shrq(destination, Immediate(16));
++    constexpr int kUntagShift =
++        kBitsPerSystemPointer - (kTrustedPointerTableTagShift - 1);
++    shlq(destination, Immediate(kUntagShift));
++    shrq(destination, Immediate(kUntagShift));
+   }
+ }
+ 
+@@ -926,7 +928,7 @@ void MacroAssembler::LoadParameterCountFromJSDispatchTable(
+   shll(destination, Immediate(kJSDispatchTableEntrySizeLog2));
+   static_assert(JSDispatchEntry::kParameterCountMask == 0xffff);
+   movzxwq(destination, Operand(kScratchRegister, destination, times_1,
+-                               JSDispatchEntry::kCodeObjectOffset));
++                               JSDispatchEntry::kParameterCountOffset));
+ }
+ 
+ void MacroAssembler::LoadEntrypointAndParameterCountFromJSDispatchTable(
+@@ -944,7 +946,7 @@ void MacroAssembler::LoadEntrypointAndParameterCountFromJSDispatchTable(
+                            JSDispatchEntry::kEntrypointOffset));
+   static_assert(JSDispatchEntry::kParameterCountMask == 0xffff);
+   movzxwq(parameter_count, Operand(kScratchRegister, offset, times_1,
+-                                   JSDispatchEntry::kCodeObjectOffset));
++                                   JSDispatchEntry::kParameterCountOffset));
+ }
+ 
+ void MacroAssembler::LoadProtectedPointerField(Register destination,
+diff --git a/orig/v8-15.2.124.1/src/common/globals.h b/mod/v8-15.2.124.1/src/common/globals.h
+index 1e033da..a410a8c 100644
+--- a/orig/v8-15.2.124.1/src/common/globals.h
++++ b/mod/v8-15.2.124.1/src/common/globals.h
+@@ -607,8 +607,13 @@ using JSDispatchHandle =
+ 
+ constexpr JSDispatchHandle kNullJSDispatchHandle(0);
+ 
++#if V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
++constexpr int kJSDispatchTableEntrySize = 32;
++constexpr int kJSDispatchTableEntrySizeLog2 = 5;
++#else
+ constexpr int kJSDispatchTableEntrySize = 16;
+ constexpr int kJSDispatchTableEntrySizeLog2 = 4;
++#endif  // V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
+ 
+ // The size of the virtual memory reservation for the JSDispatchTable.
+ // As with the other tables, a maximum table size in combination with shifted
+@@ -619,7 +624,7 @@ constexpr int kJSDispatchTableEntrySizeLog2 = 4;
+ constexpr size_t kJSDispatchTableReservationSize = 128 * MB;
+ #else
+ constexpr size_t kJSDispatchTableReservationSize =
+-    (V8_LOWER_LIMITS_MODE_BOOL ? 16 : 256) * MB;
++    (V8_LOWER_LIMITS_MODE_BOOL ? 1 : 16) * kJSDispatchTableEntrySize * MB;
+ #endif  // defined(V8_TARGET_OS_IOS)
+ // The maximum number of entries in a JSDispatchTable.
+ constexpr size_t kMaxJSDispatchEntries =
+diff --git a/orig/v8-15.2.124.1/src/compiler/code-assembler.h b/mod/v8-15.2.124.1/src/compiler/code-assembler.h
+index 78f4dd9..5468d7b 100644
+--- a/orig/v8-15.2.124.1/src/compiler/code-assembler.h
++++ b/mod/v8-15.2.124.1/src/compiler/code-assembler.h
+@@ -649,6 +649,9 @@ class V8_EXPORT_PRIVATE CodeAssembler {
+   TNode<UintPtrT> UintPtrConstant(uintptr_t value) {
+     return Unsigned(IntPtrConstant(base::bit_cast<intptr_t>(value)));
+   }
++  TNode<UintPtrT> UniqueUintPtrConstant(uintptr_t value) {
++    return Unsigned(UniqueIntPtrConstant(base::bit_cast<intptr_t>(value)));
++  }
+   TNode<TaggedIndex> TaggedIndexConstant(intptr_t value);
+   TNode<RawPtrT> PointerConstant(void* value) {
+     return ReinterpretCast<RawPtrT>(
+diff --git a/orig/v8-15.2.124.1/src/sandbox/code-entrypoint-tag.h b/mod/v8-15.2.124.1/src/sandbox/code-entrypoint-tag.h
+index 7f4d167..36af5fb 100644
+--- a/orig/v8-15.2.124.1/src/sandbox/code-entrypoint-tag.h
++++ b/mod/v8-15.2.124.1/src/sandbox/code-entrypoint-tag.h
+@@ -32,7 +32,11 @@ namespace internal {
+ // match, the resulting pointer will be invalid and cause a safe crash.
+ // TODO(saelo): on Arm64, we could probably use PAC instead of XORing the tag
+ // into the pointer. This may be more efficient.
++#if V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
++constexpr int kCodeEntrypointTagShift = 57;
++#else   // !(V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57)
+ constexpr int kCodeEntrypointTagShift = 48;
++#endif  // !(V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57)
+ enum CodeEntrypointTag : uint64_t {
+   kJSEntrypointTag = 0,
+   kWasmEntrypointTag = uint64_t{1} << kCodeEntrypointTagShift,
+@@ -53,15 +57,20 @@ enum CodeEntrypointTag : uint64_t {
+   // TODO(saelo): create more of these tags.
+ 
+   // Tag to use for Code objects with stub linkage created by unittests.
+-  kCodeEntrypointTagForTesting = uint64_t{0xfc} << kCodeEntrypointTagShift,
++  kCodeEntrypointTagForTesting = uint64_t{0x7c} << kCodeEntrypointTagShift,
+ 
+   // Tag to use for Code objects corresponding to currently disabled builtins.
+-  kDisabledBuiltinEntrypointTag = uint64_t{0xfd} << kCodeEntrypointTagShift,
++  kDisabledBuiltinEntrypointTag = uint64_t{0x7d} << kCodeEntrypointTagShift,
+ 
+   // Sentinel tag to use for code that should never be called.
+-  kInvalidEntrypointTag = uint64_t{0xff} << kCodeEntrypointTagShift,
++  kInvalidEntrypointTag = uint64_t{0x7f} << kCodeEntrypointTagShift,
+ };
+ 
++#ifdef V8_ENABLE_SANDBOX
++// All tags must fit into the 7 tag bits of an x64 entry on LA57.
++static_assert(kCodeEntrypointTagShift + 7 <= kBitsPerSystemPointer);
++#endif  // V8_ENABLE_SANDBOX
++
+ }  // namespace internal
+ }  // namespace v8
+ 
+diff --git a/orig/v8-15.2.124.1/src/sandbox/indirect-pointer-tag.h b/mod/v8-15.2.124.1/src/sandbox/indirect-pointer-tag.h
+index 454c5e8..ac31f77 100644
+--- a/orig/v8-15.2.124.1/src/sandbox/indirect-pointer-tag.h
++++ b/mod/v8-15.2.124.1/src/sandbox/indirect-pointer-tag.h
+@@ -23,20 +23,37 @@ namespace internal {
+ //
+ // A trusted pointer table entry has the following layout:
+ //
+-// +------------+----------+-----------------+
+-// | 15-bit tag | mark bit | 48-bit payload  |
+-// +------------+----------+-----------------+
++// On x64, the payload must be able to hold 57-bit addresses (LA57):
++//
++// +-----------+----------+----------------+
++// | 7-bit tag | mark bit | 56-bit payload |
++// +-----------+----------+----------------+
++//
++// On the other 64-bit architectures (e.g. Arm64), addresses are at most 48
++// bits wide. The tag field is 15 bits wide there, but as tags are limited to
++// 7 bits, its top 8 bits are currently unused and left for TBI/MTE:
++//
++// +---------------+-----------+----------+----------------+
++// | 8 unused bits | 7-bit tag | mark bit | 48-bit payload |
++// +---------------+-----------+----------+----------------+
+ //
+ // This format ensures that both the tag and the payload can be extracted
+ // efficiently, and thereby helps keep the performance overhead low.
++#if V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
++constexpr uint64_t kTrustedPointerTableTagMask = 0xfe00'0000'0000'0000;
++constexpr uint64_t kTrustedPointerTableMarkBit = 0x0100'0000'0000'0000;
++constexpr uint64_t kTrustedPointerTablePayloadMask = 0x00ff'ffff'ffff'ffff;
++constexpr uint64_t kTrustedPointerTableTagShift = 57;
++#else   // !(V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57)
+ constexpr uint64_t kTrustedPointerTableTagMask = 0xfffe'0000'0000'0000;
+ constexpr uint64_t kTrustedPointerTableMarkBit = 0x0001'0000'0000'0000;
+ constexpr uint64_t kTrustedPointerTablePayloadMask = 0x0000'ffff'ffff'ffff;
+ constexpr uint64_t kTrustedPointerTableTagShift = 49;
++#endif  // !(V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57)
+ constexpr uint64_t kTrustedPointerTablePayloadShift = 0;
+ 
+-// The tag is currently in practice limited to maximum 15 bits since it needs
+-// to fit together with a marking bit into the unused parts of a pointer.
++// The tag is limited to 7 bits since it needs to fit together with a marking
++// bit into the unused parts of a pointer on x64 (see the layout above).
+ enum IndirectPointerTag : uint16_t {
+   kIndirectPointerNullTag = 0,
+ 
+@@ -75,9 +92,9 @@ enum IndirectPointerTag : uint16_t {
+ 
+   // Special tags.
+   //
+-  // Currently we only use 8 bits (plus one marking bit) so we have spare bits
+-  // in the pointers if we ever need them (e.g. for something like MTE).
+-  // If we ever need more tags, we could go up to 15 bits though.
++  // Currently we only use 7 bits (plus one marking bit), which is all that is
++  // available on x64. On the other architectures we have spare bits in the
++  // pointers if we ever need them (e.g. for something like MTE).
+   //
+ 
+   // A special tag for objects that should not (yet) be exposed to the sandbox.
+@@ -92,16 +109,19 @@ enum IndirectPointerTag : uint16_t {
+   //    accessible from within the sandbox (for example, bytecode arrays), then
+   //    these objects can first be created in an unpublished state and then
+   //    only be published after successful validation.
+-  kUnpublishedIndirectPointerTag = 0xfc,
++  kUnpublishedIndirectPointerTag = 0x7c,
+   // Tag for zapped entries in the trusted pointer table.
+-  kIndirectPointerZappedEntryTag = 0xfd,
++  kIndirectPointerZappedEntryTag = 0x7d,
+   // Not currently used for the trusted pointer table.
+-  kIndirectPointerEvacuationEntryTag = 0xfe,
++  kIndirectPointerEvacuationEntryTag = 0x7e,
+   // Tag for free entries in the trusted pointer table.
+-  kIndirectPointerFreeEntryTag = 0xff,
+-  kLastIndirectPointerTag = 0xff,
++  kIndirectPointerFreeEntryTag = 0x7f,
++  kLastIndirectPointerTag = 0x7f,
+ };
+ 
++// All tags must fit into the 7 tag bits of an x64 trusted pointer table entry.
++static_assert(kLastIndirectPointerTag <= 0x7f);
++
+ using IndirectPointerTagRange = TagRange<IndirectPointerTag>;
+ 
+ #if V8_TARGET_ARCH_ARM64
+diff --git a/orig/v8-15.2.124.1/src/sandbox/js-dispatch-table-inl.h b/mod/v8-15.2.124.1/src/sandbox/js-dispatch-table-inl.h
+index 5566fc6..c43dd40 100644
+--- a/orig/v8-15.2.124.1/src/sandbox/js-dispatch-table-inl.h
++++ b/mod/v8-15.2.124.1/src/sandbox/js-dispatch-table-inl.h
+@@ -29,6 +29,10 @@ void JSDispatchEntry::MakeJSDispatchEntry(Address object, Address entrypoint,
+                                           bool mark_as_alive) {
+   DCHECK_NE(entrypoint, kNullAddress);
+   DCHECK_EQ(object & kHeapObjectTag, 0);
++#if V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
++  DCHECK_EQ(parameter_count & ~kParameterCountMask, 0);
++  Address payload = parameter_count;
++#else   // !(V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57)
+   DCHECK_EQ((((object - kObjectPointerOffset) << kObjectPointerShift) >>
+              kObjectPointerShift) +
+                 kObjectPointerOffset,
+@@ -39,14 +43,20 @@ void JSDispatchEntry::MakeJSDispatchEntry(Address object, Address entrypoint,
+ 
+   Address payload = ((object - kObjectPointerOffset) << kObjectPointerShift) |
+                     (parameter_count & kParameterCountMask);
+-  DCHECK(!(payload & kMarkingBit));
+-  if (mark_as_alive) payload |= kMarkingBit;
++#endif  // !(V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57)
+ #ifdef V8_TARGET_ARCH_32_BIT
+   parameter_count_.store(parameter_count, std::memory_order_relaxed);
+   next_free_entry_.store(0, std::memory_order_relaxed);
+-#endif
++#endif  // V8_TARGET_ARCH_32_BIT
++  DCHECK(!(payload & kMarkingBit));
++  if (mark_as_alive) payload |= kMarkingBit;
+   entrypoint_.store(entrypoint, std::memory_order_relaxed);
++#if V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
++  encoded_word_.store(payload, std::memory_order_relaxed);
++  code_object_.store(object | kHeapObjectTag, std::memory_order_release);
++#else
+   encoded_word_.store(payload, std::memory_order_release);
++#endif  // V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
+   DCHECK(!IsFreelistEntry());
+ }
+ 
+@@ -57,12 +67,16 @@ Address JSDispatchEntry::GetEntrypoint() const {
+ 
+ Address JSDispatchEntry::GetCodePointer() const {
+   DCHECK(!IsFreelistEntry());
++#if V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
++  return code_object_.load(std::memory_order_acquire);
++#else
+   // The pointer tag bit (LSB) of the object pointer is used as marking bit,
+   // and so may be 0 or 1 here. As the return value is a tagged pointer, the
+   // bit must be 1 when returned, so we need to set it here.
+   Address payload = encoded_word_.load(std::memory_order_acquire);
+   return ((payload >> kObjectPointerShift) + kObjectPointerOffset) |
+          kHeapObjectTag;
++#endif  // V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
+ }
+ 
+ Tagged<Code> JSDispatchEntry::GetCode() const {
+@@ -222,6 +236,11 @@ void JSDispatchEntry::SetCodeAndEntrypointPointer(Address new_object,
+                                                   Address new_entrypoint,
+                                                   Isolate* isolate) {
+   DCHECK_NE(new_entrypoint, kNullAddress);
++#if V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
++  DCHECK(Internals::HasHeapObjectTag(new_object));
++  entrypoint_.store(new_entrypoint, std::memory_order_relaxed);
++  code_object_.store(new_object, std::memory_order_release);
++#else   // !(V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57)
+   Address old_payload = encoded_word_.load(std::memory_order_relaxed);
+   Address marking_bit = old_payload & kMarkingBit;
+   Address parameter_count = old_payload & kParameterCountMask;
+@@ -246,6 +265,7 @@ void JSDispatchEntry::SetCodeAndEntrypointPointer(Address new_object,
+       new_payload = object | marking_bit | parameter_count;
+     }
+   }
++#endif  // !(V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57)
+   DCHECK(!IsFreelistEntry());
+ }
+ 
+@@ -263,6 +283,9 @@ void JSDispatchEntry::MakeFreelistEntry(uint32_t next_entry_index) {
+   next_free_entry_.store(next_entry_index + 1, std::memory_order_relaxed);
+   entrypoint_.store(kNullAddress, std::memory_order_relaxed);
+ #endif
++#if V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
++  code_object_.store(kNullAddress, std::memory_order_relaxed);
++#endif  // V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
+   encoded_word_.store(kNullAddress, std::memory_order_relaxed);
+   DCHECK(IsFreelistEntry());
+ }
+diff --git a/orig/v8-15.2.124.1/src/sandbox/js-dispatch-table.cc b/mod/v8-15.2.124.1/src/sandbox/js-dispatch-table.cc
+index cc21c21..fcefe86 100644
+--- a/orig/v8-15.2.124.1/src/sandbox/js-dispatch-table.cc
++++ b/mod/v8-15.2.124.1/src/sandbox/js-dispatch-table.cc
+@@ -18,8 +18,13 @@ namespace internal {
+ void JSDispatchEntry::CheckFieldOffsets() {
+   static_assert(JSDispatchEntry::kEntrypointOffset ==
+                 offsetof(JSDispatchEntry, entrypoint_));
++#if V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
++  static_assert(JSDispatchEntry::kCodeObjectOffset ==
++                offsetof(JSDispatchEntry, code_object_));
++#else
+   static_assert(JSDispatchEntry::kCodeObjectOffset ==
+                 offsetof(JSDispatchEntry, encoded_word_));
++#endif  // V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
+ #if defined(V8_TARGET_ARCH_64_BIT)
+ #ifdef V8_TARGET_BIG_ENDIAN
+   // 2-byte parameter count is on the least significant side of encoded_word_.
+diff --git a/orig/v8-15.2.124.1/src/sandbox/js-dispatch-table.h b/mod/v8-15.2.124.1/src/sandbox/js-dispatch-table.h
+index 0912c40..2b467bf 100644
+--- a/orig/v8-15.2.124.1/src/sandbox/js-dispatch-table.h
++++ b/mod/v8-15.2.124.1/src/sandbox/js-dispatch-table.h
+@@ -94,8 +94,18 @@ struct JSDispatchEntry {
+ #endif
+ 
+ #if defined(V8_TARGET_ARCH_64_BIT)
++  static constexpr uint32_t kMaxParameterCountBits = 16;
++  static constexpr uint32_t kParameterCountMask =
++      (1 << kMaxParameterCountBits) - 1;
+   // Freelist entries contain the index of the next free entry in their lower 32
+   // bits and are tagged with this tag.
++#if V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
++  // On x64, only the top byte is set so that it does not overlap with 57-bit
++  // user-space addresses (LA57).
++  static constexpr Address kFreeEntryTag = 0xff00000000000000ull;
++  static constexpr uintptr_t kParameterCountOffset = 2 * kSystemPointerSize;
++  static constexpr uint32_t kObjectPointerShift = 0;
++#else  // !(V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57)
+   static constexpr Address kFreeEntryTag = 0xffff000000000000ull;
+ #ifdef V8_TARGET_BIG_ENDIAN
+   // 2-byte parameter count is on the least significant side of encoded_word_.
+@@ -106,8 +116,8 @@ struct JSDispatchEntry {
+ #else
+   static constexpr uintptr_t kParameterCountOffset = kCodeObjectOffset;
+ #endif  // V8_TARGET_BIG_ENDIAN
+-  static constexpr uint32_t kObjectPointerShift = 16;
+-  static constexpr uint32_t kParameterCountMask = 0xffff;
++  static constexpr uint32_t kObjectPointerShift = kMaxParameterCountBits;
++#endif  // !(V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57)
+ #elif defined(V8_TARGET_ARCH_32_BIT)
+   static constexpr uintptr_t kParameterCountOffset =
+       kCodeObjectOffset + kSystemPointerSize;
+@@ -125,12 +135,28 @@ struct JSDispatchEntry {
+   // The first word contains the pointer to the (executable) entrypoint.
+   std::atomic<Address> entrypoint_;
+ 
+-  // On 64 bit architectures the second word of the entry contains (1) the
+-  // pointer to the code object associated with this entry, (2) the marking bit
+-  // of the entry in the LSB of the object pointer (which must be unused as the
+-  // address must be aligned), and (3) the 16-bit parameter count. The parameter
+-  // count is stored in the lower 16 bits and therefore the pointer is shifted
+-  // to the left. The final format therefore looks as follows:
++  // On x64, the entry is 32 bytes to support full 57-bit (LA57) pointers.
++  // Following the entrypoint word, the second word contains the tagged Code
++  // object pointer, the third word contains the marking bit and 16-bit
++  // parameter count, and the fourth word is unused padding:
++  //
++  // +----------------------------------------------------------+
++  // | Bits 63 ... 0                                            |
++  // |  HeapObject pointer                                      |
++  // +----------------------+---------------+-------------------+
++  // | Bits 63 ... 17       | Bit 16        | Bits 15 ... 0     |
++  // |  Unused              |  Marking bit  |  Parameter count  |
++  // +----------------------+---------------+-------------------+
++  // | Bits 63 ... 0                                            |
++  // |  Padding (unused)                                        |
++  // +----------------------------------------------------------+
++  //
++  // On the other 64 bit architectures the second word of the entry contains (1)
++  // the pointer to the code object associated with this entry, (2) the marking
++  // bit of the entry in the LSB of the object pointer (which must be unused as
++  // the address must be aligned), and (3) the 16-bit parameter count. The
++  // parameter count is stored in the lower 16 bits and therefore the pointer is
++  // shifted to the left. The final format therefore looks as follows:
+   //
+   // +----------------------+---------------+-------------------+
+   // | Bits 63 ... 17       | Bit 16        | Bits 15 ... 0     |
+@@ -148,16 +174,23 @@ struct JSDispatchEntry {
+   // individual parts and unify with 32 bit. For instance we could try to store
+   // the code pointer in some compressd format, such that it fits into 32 bits.
+ 
++#if V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
++  std::atomic<Address> code_object_;
++  static constexpr Address kMarkingBit = 1 << kMaxParameterCountBits;
++#else
+   static constexpr Address kMarkingBit = 1 << kObjectPointerShift;
++#endif  // V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
+   std::atomic<Address> encoded_word_;
+ 
+-#ifdef V8_TARGET_ARCH_32_BIT
++#if V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
++  [[maybe_unused]] uint64_t padding_;
++#elif defined(V8_TARGET_ARCH_32_BIT)
+   // TODO(olivf): Investigate if we could shrink the entry size on 32bit
+   // platforms to 12 bytes.
+   std::atomic<uint16_t> parameter_count_;
+   // 16 bits of padding
+   std::atomic<uint32_t> next_free_entry_;
+-#endif  // V8_TARGET_ARCH_32_BIT
++#endif  // defined(V8_TARGET_ARCH_32_BIT)
+ };
+ 
+ static_assert(sizeof(JSDispatchEntry) == kJSDispatchTableEntrySize);
+diff --git a/orig/v8-15.2.124.1/src/sandbox/sandbox.h b/mod/v8-15.2.124.1/src/sandbox/sandbox.h
+index d566a3f..115b8c8 100644
+--- a/orig/v8-15.2.124.1/src/sandbox/sandbox.h
++++ b/mod/v8-15.2.124.1/src/sandbox/sandbox.h
+@@ -85,7 +85,11 @@ class V8_EXPORT_PRIVATE Sandbox {
+   // unaddressable accesses (e.g. on ARM64). Note that this is only a testing
+   // heuristic and does not reflect the actual virtual address space size,
+   // which is determined dynamically during sandbox initialization.
++#if V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57
++  static constexpr int kMaxVirtualAddressBitsForCrashFilter = 57;
++#else   // !(V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57)
+   static constexpr int kMaxVirtualAddressBitsForCrashFilter = 48;
++#endif  // !(V8_TARGET_ARCH_X64 && V8_SUPPORT_LA57)
+ 
+   /**
+    * Initializes this sandbox.
